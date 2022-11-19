@@ -5,8 +5,6 @@
 //! there is a hard cap on the maximum reachable speed.
 //! 
 //! Please make sure that your terminal can show at least 34 rows at once to run the emulator, otherwise weird graphic glitches will occur.
-//! Key-Input is currently only read once per fetch/decode/execute loop iteration, therefore, you may need to hold the keys down longer for them
-//! to register. 
 
 mod utils;
 mod system;

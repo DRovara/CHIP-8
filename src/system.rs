@@ -2,6 +2,7 @@
 
 extern crate user32;
 use rand::rngs::ThreadRng as ThreadRng;
+use std::sync::mpsc::{self, Sender};
 use std::{thread};
 use std::time::{SystemTime, Duration, UNIX_EPOCH};
 use crate::program::{self, Instruction};
@@ -373,26 +374,6 @@ pub struct Keyboad {
     latest: u8,
 }
 
-/// Maps 16 QWERTY keyboard keys to the corresponding CHIP-8 key index they should represent.
-const KEYBOARD_KEYS: [u8; 16] = [
-    b'X',
-    b'1',
-    b'2',
-    b'3',
-    b'Q',
-    b'W',
-    b'E',
-    b'A',
-    b'S',
-    b'D',
-    b'Z',
-    b'C',
-    b'4',
-    b'R',
-    b'F',
-    b'V',
-];
-
 
 impl Keyboad {
 
@@ -427,29 +408,27 @@ impl Keyboad {
     /// Updates the state of the keyboard.
     /// 
     /// Invokes the `user32::GetAsyncKeyState(...)` function for each possible key to get its current state and stores it. It also updates the value of the
-    /// `latest` field, indicating the latest key that was pressed (or 0x10 if no key was pressed).
-    pub fn update(&mut self) {
-        self.latest = 16;
-        for (idx, key) in KEYBOARD_KEYS.iter().enumerate() {
-            if unsafe { user32::GetAsyncKeyState(*key as u8 as i32) } == -32767 {
-                self.latest = idx as u8;
-                self.keys[idx] = true;
+    /// `latest` field, indicating the latest key that was pressed.
+    pub fn update(&mut self, idx: u8) {
+        if idx < 16 {
+            if self.keys[idx as usize] {
+                self.latest = idx;
             }
-            else {
-                self.keys[idx] = false;
-            }
+            self.keys[idx as usize] = !self.keys[idx as usize];
         }
     }
 
-    /// Gets the index of the latest key that was pressed (or 0x10 if no key was pressed).
+    /// Gets the index of the latest key that was pressed (or 0x10 if no key was pressed) and then resets the value.
     /// 
     /// # Example
     /// ```
     /// let kb = Keyboard::new();
     /// let latest = kb.latest();
     /// ```
-    pub fn latest(&self) -> u8 {
-        self.latest
+    pub fn latest(&mut self) -> u8 {
+        let x = self.latest;
+        self.latest = 0x10;
+        return x;
     }
 }
 
@@ -483,7 +462,7 @@ impl Display {
     /// display.update(system);
     /// ```
     pub fn update(&mut self, sys: &System) {
-        let mut changes = false;
+        let mut change_positions = Vec::new();
         for i in 0xF00..=0xFFF {
             let byte = sys.memory.get(i);
             let pos = i - 0xF00;
@@ -492,26 +471,23 @@ impl Display {
             for j in 0..8 {
                 if (byte & (1 << (7-j))) > 0 {
                     if self.pixels[y as usize][(x + j) as usize] == 0 {
-                        changes = true;
+                        change_positions.push((y, x + j));
                     }
                     self.pixels[y as usize][(x + j) as usize] = 4;
                 }
                 else if self.pixels[y as usize][(x + j) as usize] > 0 {
                     self.pixels[y as usize][(x + j) as usize] -= 1;
                     if self.pixels[y as usize][(x + j) as usize] == 0 {
-                        changes = true;
+                        change_positions.push((y, x + j));
                     }
                 }
             }
         }
 
-        if changes {
-            self.render();
-        }
+        self.render(&change_positions);
     }
 
-    /// Renders the current state of the `pixels` matrix to the console. Called by the `update(...)` method.
-    fn render(&self) {
+    fn clear_screen(&self) {
         for y in 0..34 {
             if y == 0 || y == 33 {
                 print!("{}[{};{}H", 27 as char, y + 1, 1);
@@ -543,11 +519,7 @@ impl Display {
                     0 => '║',
                     65 => '║',
                     _ => {
-                        let pixel = self.pixels[y - 1][x - 1];
-                        match pixel {
-                            0 => ' ',
-                            _ => '█',
-                        }
+                        ' '
                     },
                 };
 
@@ -561,6 +533,25 @@ impl Display {
                 
                 
             }
+        }
+        println!("{}[{};{}H", 27 as char, 36, 0);
+    }
+
+    /// Renders the current state of the `pixels` matrix to the console. Called by the `update(...)` method.
+    fn render(&self, change_positions: &Vec<(u16, u16)>) {
+        for (y, x) in change_positions {
+            let c = match x {
+                0 => '║',
+                65 => '║',
+                _ => {
+                    let pixel = self.pixels[*y as usize][*x as usize];
+                    match pixel {
+                        0 => ' ',
+                        _ => '█',
+                    }
+                },
+            };
+            print!("{}[{};{}H{}{}", 27 as char, *y + 2, *x * 2, c, c);
         }
         println!("{}[{};{}H", 27 as char, 36, 0);
     }
@@ -660,11 +651,22 @@ impl System {
     /// sys.run(&mut display);
     /// ```
     pub fn run(&mut self, display: &mut Display) {
+
+        display.clear_screen();
+
+        let (tx, rx) = mpsc::channel::<u8>();
+        thread::spawn(move || {
+            do_keyboard_check(tx);
+        });
+
         let delay = 1000000u64/self.loop_frequency as u64;
         loop {
             self.delay_timer.update();
             self.sound_timer.update();
-            self.keyboard.update();
+
+            if let Ok(idx) = rx.try_recv() {
+                self.keyboard.update(idx);
+            }
 
             //Fetch
             let op1 = self.memory.get(self.pc);
@@ -684,6 +686,56 @@ impl System {
             //frequency
             thread::sleep(Duration::from_micros(delay));
         }
+
         println!("CHIP-8 Finished!");
+    }
+}
+
+
+/// Maps 16 QWERTY keyboard keys to the corresponding CHIP-8 key index they should represent.
+const KEYBOARD_KEYS: [u8; 16] = [
+    b'X',
+    b'1',
+    b'2',
+    b'3',
+    b'Q',
+    b'W',
+    b'E',
+    b'A',
+    b'S',
+    b'D',
+    b'Z',
+    b'C',
+    b'4',
+    b'R',
+    b'F',
+    b'V',
+];
+
+/// A worker thread responsible for polling the keyboard state repeatedly, sending updates to the main thread.
+fn do_keyboard_check(tx: Sender<u8>) {
+    let mut states = [0;16];
+
+    'outer: loop {
+        thread::sleep(Duration::from_millis(10));
+        for (idx, key) in KEYBOARD_KEYS.iter().enumerate() {
+            let state = unsafe { user32::GetAsyncKeyState(*key as u8 as i32) } == -32767;
+
+            if state {
+                if states[idx] == 0 {
+                    if tx.send(idx as u8).is_err() {
+                        break 'outer;
+                    }
+                }
+                states[idx] = 50;
+            } else if states[idx] > 0 {
+                states[idx] -= 1;
+                if states[idx] == 0 {
+                    if tx.send(idx as u8).is_err() {
+                        break 'outer;
+                    }
+                }
+            }
+        }
     }
 }
